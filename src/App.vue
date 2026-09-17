@@ -97,6 +97,22 @@ const project = {
 
 const fields = project.fields as readonly Field[];
 const statuses = [...project.statuses];
+const STATUS_OPEN = statuses[0];
+const STATUS_LOW = statuses[statuses.length - 1];
+const STOCK_KEY = fields.find((field) => field.type === "number")?.key ?? "stock";
+const STOCK_THRESHOLD = 10000;
+
+function getStock(record: Partial<RecordItem>) {
+  const value = Number(record[STOCK_KEY] ?? 0);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+// 库存状态闭环：低于阈值只允许“库存紧张”；达到阈值不得保留“库存紧张”，自动转“营业中”
+function resolveStatus(stock: number, status?: string) {
+  if (stock < STOCK_THRESHOLD) return STATUS_LOW;
+  if (status && status !== STATUS_LOW) return status;
+  return STATUS_OPEN;
+}
 
 function createBlank() {
   return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
@@ -104,22 +120,47 @@ function createBlank() {
 
 function loadRecords(): RecordItem[] {
   const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
+  const source: RecordItem[] = raw
+    ? (() => {
+        try {
+          const parsed: unknown = JSON.parse(raw);
+          return Array.isArray(parsed) ? (parsed as RecordItem[]) : [];
+        } catch {
+          return [];
+        }
+      })()
+    : (project.records.map((record, index) => ({
+        ...record,
+        id: `seed-${index + 1}`,
+        createdAt: new Date(Date.now() - index * 86400000).toISOString()
+      })) as RecordItem[]);
+
+  // 读取旧 localStorage 数据时同样修正库存与状态
+  let changed = false;
+  const normalized = source.map((item) => {
+    let record = item;
+    const stock = getStock(record);
+    const status = resolveStatus(stock, record.status);
+    if (Number(record[STOCK_KEY]) !== stock) {
+      record = { ...record, [STOCK_KEY]: stock };
+      changed = true;
+    }
+    if (record.status !== status) {
+      record = { ...record, status };
+      changed = true;
+    }
+    return record;
+  });
+  if (changed) localStorage.setItem(project.storageKey, JSON.stringify(normalized));
+  return normalized;
 }
 
 const records = ref<RecordItem[]>(loadRecords());
 const form = reactive<Record<string, string | number>>(createBlank());
+const formStatus = ref(STATUS_OPEN);
+const formError = ref("");
+const formNotice = ref("");
+const flowErrors = reactive<Record<string, string>>({});
 const note = ref("");
 const filter = ref(project.filters[0]);
 
@@ -130,13 +171,9 @@ const filteredRecords = computed(() => {
 
 const metrics = computed(() => {
   const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
+  const openCount = records.value.filter((record) => record.status === STATUS_OPEN).length;
+  const lowCount = records.value.filter((record) => record.status === STATUS_LOW).length;
+  return [total, openCount, lowCount];
 });
 
 const chartRows = computed(() => statuses.map((status) => ({
@@ -161,29 +198,57 @@ function primaryText(record: RecordItem) {
   return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
 }
 
+function clearFormFeedback() {
+  formError.value = "";
+  formNotice.value = "";
+}
+
 function submit() {
+  const stock = getStock(form);
+  // 库存低于阈值时只允许“库存紧张”，就地报错并保持表单原状态
+  if (stock < STOCK_THRESHOLD && formStatus.value !== STATUS_LOW) {
+    formError.value = `库存低于${STOCK_THRESHOLD.toLocaleString()}L 时只允许“${STATUS_LOW}”，请调整库存或状态。`;
+    formNotice.value = "";
+    return;
+  }
+  // 库存达到阈值不得保留“库存紧张”，自动转“营业中”
+  const status = resolveStatus(stock, formStatus.value);
+  formNotice.value =
+    status !== formStatus.value ? `库存已达${STOCK_THRESHOLD.toLocaleString()}L，状态自动转为“${STATUS_OPEN}”。` : "";
+  formError.value = "";
   records.value = [
     {
       ...form,
+      [STOCK_KEY]: stock,
       id: crypto.randomUUID(),
-      status: statuses[0],
+      status,
       notes: note.value || "暂无备注",
       createdAt: new Date().toISOString()
     } as RecordItem,
     ...records.value
   ];
   Object.assign(form, createBlank());
+  formStatus.value = STATUS_OPEN;
   note.value = "";
   persist();
 }
 
 function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
+  const stock = getStock(record);
+  // 库存紧张的油站不允许流转到其他状态，就地报错并保持原状态
+  if (stock < STOCK_THRESHOLD) {
+    flowErrors[record.id] = `库存低于${STOCK_THRESHOLD.toLocaleString()}L，仅允许“${STATUS_LOW}”，请先补足库存。`;
+    return;
+  }
+  const next = nextStatus(record.status);
+  record.status = resolveStatus(stock, next);
+  flowErrors[record.id] = "";
   persist();
 }
 
 function remove(id: string) {
   records.value = records.value.filter((record) => record.id !== id);
+  delete flowErrors[id];
   persist();
 }
 </script>
@@ -219,12 +284,31 @@ function remove(id: string) {
                 <option value="">请选择</option>
                 <option v-for="option in field.options" :key="option">{{ option }}</option>
               </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
+              <input
+                v-else
+                v-model="form[field.key]"
+                :type="field.type || 'text'"
+                :class="{ 'input-error': formError }"
+                required
+                @input="field.type === 'number' ? clearFormFeedback() : undefined"
+              />
+            </label>
+            <label>
+              营业状态
+              <select
+                v-model="formStatus"
+                :class="{ 'input-error': formError }"
+                @change="clearFormFeedback"
+              >
+                <option v-for="option in statuses" :key="option" :value="option">{{ option }}</option>
+              </select>
             </label>
             <label>
               备注
               <textarea v-model="note" placeholder="填写处理说明或现场备注" />
             </label>
+            <p v-if="formError" class="inline-error" role="alert">{{ formError }}</p>
+            <p v-else-if="formNotice" class="inline-notice" role="status">{{ formNotice }}</p>
             <button type="submit">{{ project.primaryAction }}</button>
           </div>
         </form>
@@ -253,6 +337,9 @@ function remove(id: string) {
                 <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
                 <button class="danger" type="button" @click="remove(record.id)">删除</button>
               </div>
+              <p v-if="flowErrors[record.id]" class="inline-error card-error" role="alert">
+                {{ flowErrors[record.id] }}
+              </p>
             </article>
           </div>
 
