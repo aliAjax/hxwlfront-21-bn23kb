@@ -151,6 +151,22 @@ textarea {
   resize: vertical;
 }
 
+.error-text {
+  margin: 0;
+  color: #c84b31;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.actions + .error-text {
+  margin-top: 10px;
+}
+
+.invalid {
+  border-color: #c84b31;
+  background: #fdf2ef;
+}
+
 .toolbar {
   display: flex;
   gap: 10px;
